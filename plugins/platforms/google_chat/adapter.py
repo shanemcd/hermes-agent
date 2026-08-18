@@ -342,6 +342,110 @@ def _create_kwargs(chat_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
+def _resolve_pubsub_transport(extra: Optional[Dict[str, Any]] = None) -> str:
+    """Return ``grpc`` (default streaming_pull) or ``rest`` (unary Pull).
+
+    Override with ``platforms.google_chat.pubsub_transport`` or
+    ``GOOGLE_CHAT_PUBSUB_TRANSPORT``. Unknown values fall back to grpc.
+    """
+    raw = (
+        (extra or {}).get("pubsub_transport")
+        or os.getenv("GOOGLE_CHAT_PUBSUB_TRANSPORT")
+        or "grpc"
+    )
+    val = str(raw).strip().lower()
+    if val not in {"grpc", "rest"}:
+        logger.warning(
+            "[GoogleChat] unknown pubsub_transport %r; using grpc", raw
+        )
+        return "grpc"
+    return val
+
+
+def _resolve_http_client(extra: Optional[Dict[str, Any]] = None) -> str:
+    """Return ``httplib2`` (default) or ``requests`` for Chat REST execute().
+
+    ``requests`` honors HTTPS_PROXY without PySocks. Override with
+    ``platforms.google_chat.http_client`` or ``GOOGLE_CHAT_HTTP_CLIENT``.
+    """
+    raw = (
+        (extra or {}).get("http_client")
+        or os.getenv("GOOGLE_CHAT_HTTP_CLIENT")
+        or "httplib2"
+    )
+    val = str(raw).strip().lower()
+    if val not in {"httplib2", "requests"}:
+        logger.warning(
+            "[GoogleChat] unknown http_client %r; using httplib2", raw
+        )
+        return "httplib2"
+    return val
+
+
+class _EnvProxyHttp:
+    """httplib2-compatible client that uses requests (honors HTTPS_PROXY).
+
+    httplib2 only applies HTTP_PROXY when PySocks is installed; otherwise
+    ProxyInfo.isgood() is falsy and it DNS-resolves chat.googleapis.com
+    without going through an intercepting proxy.
+    """
+
+    def request(
+        self,
+        uri,
+        method="GET",
+        body=None,
+        headers=None,
+        redirections=5,
+        connection_type=None,
+        **kwargs,
+    ):
+        import requests
+        from httplib2 import Response
+
+        r = requests.request(
+            method=method,
+            url=uri,
+            data=body,
+            headers=headers or {},
+            timeout=30,
+            allow_redirects=bool(redirections),
+        )
+        resp = Response(dict(r.headers))
+        resp.status = r.status_code
+        resp.reason = r.reason
+        return resp, r.content
+
+
+class _RestPubsubMessage:
+    """Stand-in for streaming_pull Message when using unary REST Pull."""
+
+    def __init__(self, subscriber, subscription_path, received):
+        self._subscriber = subscriber
+        self._subscription_path = subscription_path
+        self._ack_id = received.ack_id
+        msg = received.message
+        self.data = msg.data
+        self.attributes = dict(msg.attributes or {})
+
+    def ack(self) -> None:
+        self._subscriber.acknowledge(
+            request={
+                "subscription": self._subscription_path,
+                "ack_ids": [self._ack_id],
+            }
+        )
+
+    def nack(self) -> None:
+        self._subscriber.modify_ack_deadline(
+            request={
+                "subscription": self._subscription_path,
+                "ack_ids": [self._ack_id],
+                "ack_deadline_seconds": 0,
+            }
+        )
+
+
 class GoogleChatAdapter(BasePlatformAdapter):
     """Google Chat bot adapter: Pub/Sub pull (or HTTP callbacks) + Chat REST API. Env vars
     are documented in gateway/config.py (GOOGLE_CHAT_PROJECT_ID, GOOGLE_CHAT_SUBSCRIPTION_NAME,
@@ -397,6 +501,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
         self._bootstrap_spaces = str(
             extra.get("bootstrap_spaces") or _get_scoped_secret("GOOGLE_CHAT_BOOTSTRAP_SPACES", "") or "").strip()
         self._debug_raw = bool(extra.get("debug_raw") or _get_scoped_secret("GOOGLE_CHAT_DEBUG_RAW"))
+        self._pubsub_transport = _resolve_pubsub_transport(self.config.extra)
+        self._http_client = _resolve_http_client(self.config.extra)
         self._http_events_url = self._str_setting(extra, "http_events_url", "GOOGLE_CHAT_HTTP_EVENTS_URL")
         self._http_events_audience = self._str_setting(
             extra, "http_events_audience", "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", self._http_events_url)
@@ -1158,102 +1264,12 @@ class GoogleChatAdapter(BasePlatformAdapter):
         """
         return _format_message(content)
 
-<<<<<<< HEAD
     def _resolve_thread_id(self, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
                            chat_id: Optional[str] = None) -> Optional[str]:
         """Thread to reply under, or None: ``metadata['thread_id']`` → ``thread_name`` /
         ``thread_ts`` aliases → ``reply_to`` when already a ``spaces/X/threads/Y`` name →
         ``_last_inbound_thread[chat_id]`` (else DM replies land top-level). Cron deliveries
         (``job_id`` in metadata) skip the last fallback so output is not buried in a stale thread."""
-=======
-        text = content
-        placeholders: Dict[str, str] = {}
-        counter = [0]
-
-        def _ph(value: str) -> str:
-            key = f"@@HERMES_GC_PH_{counter[0]}@@"
-            counter[0] += 1
-            placeholders[key] = value
-            return key
-
-        # Protect fenced and inline code blocks from transformation.
-        # Fenced blocks first (``` ... ```), then inline code (`...`).
-        text = re.sub(
-            r"(```(?:[^\n]*\n)?[\s\S]*?```)",
-            lambda m: _ph(m.group(0)),
-            text,
-        )
-        text = re.sub(r"(`[^`]+`)", lambda m: _ph(m.group(0)), text)
-
-        # Headers (## Title) → *Title* (Chat has no header support).
-        text = re.sub(
-            r"^#{1,6}\s+(.+)$",
-            lambda m: _ph(f"*{m.group(1).strip()}*"),
-            text,
-            flags=re.MULTILINE,
-        )
-
-        # Bold+italic: ***text*** → *_text_*
-        text = re.sub(
-            r"\*\*\*(.+?)\*\*\*",
-            lambda m: _ph(f"*_{m.group(1)}_*"),
-            text,
-        )
-
-        # Bold: **text** → *text* (Chat uses single asterisks).
-        text = re.sub(
-            r"\*\*(.+?)\*\*",
-            lambda m: _ph(f"*{m.group(1)}*"),
-            text,
-        )
-
-        # Markdown links [text](url) → <url|text> (Slack-style angle-bracket).
-        text = re.sub(
-            r"\[([^\]]+)\]\(([^)]+)\)",
-            lambda m: _ph(f"<{m.group(2)}|{m.group(1)}>"),
-            text,
-        )
-
-        # Strip invisible Unicode that renders as tofu.
-        text = cls._INVISIBLE_RE.sub("", text)
-
-        # Collapse double spaces left over from stripped chars.
-        text = re.sub(r"  +", " ", text)
-
-        # Restore outer placeholders first so nested keys inside values
-        # (bold/link/header wrapping code) still expand. NUL-wrapped GC{n}
-        # tokens leaked as "GC1" in Chat when restore order was wrong or
-        # when the API stripped NULs.
-        for key, value in reversed(list(placeholders.items())):
-            text = text.replace(key, value)
-
-        return text
-
-    def _resolve_thread_id(
-        self,
-        reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-        chat_id: Optional[str] = None,
-    ) -> Optional[str]:
-        """Return the Google Chat thread resource name to reply under, or None.
-
-        Priority:
-          1. ``metadata['thread_id']`` — populated by the gateway's session
-             plumbing from ``SessionSource.thread_id`` (the inbound
-             ``thread.name``). Canonical path for groups.
-          2. ``metadata['thread_name']`` / ``metadata['thread_ts']`` — Slack
-             precedent aliases that the broader codebase sometimes passes.
-          3. ``reply_to`` if it already looks like a thread resource name
-             (``spaces/X/threads/Y``). Message names ``spaces/X/messages/Y``
-             cannot be converted to threads without an extra API call.
-          4. ``self._last_inbound_thread[chat_id]`` — Google Chat DMs spawn
-             a new thread per top-level user message, and the adapter
-             intentionally drops thread_id from the source so the session
-             key stays stable. Without this fallback, DM replies would
-             land at top-level (a fresh thread separate from the user's),
-             visually disconnected from the user's question.
-        """
->>>>>>> adbc8b382e (fix(google-chat): stop format_message leaking GC1 placeholders)
         if metadata:
             for key in ("thread_id", "thread_name", "thread_ts"):
                 if metadata.get(key):
