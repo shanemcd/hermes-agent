@@ -622,6 +622,110 @@ class _ThreadCountStore:
             )
 
 
+def _resolve_pubsub_transport(extra: Optional[Dict[str, Any]] = None) -> str:
+    """Return ``grpc`` (default streaming_pull) or ``rest`` (unary Pull).
+
+    Override with ``platforms.google_chat.pubsub_transport`` or
+    ``GOOGLE_CHAT_PUBSUB_TRANSPORT``. Unknown values fall back to grpc.
+    """
+    raw = (
+        (extra or {}).get("pubsub_transport")
+        or os.getenv("GOOGLE_CHAT_PUBSUB_TRANSPORT")
+        or "grpc"
+    )
+    val = str(raw).strip().lower()
+    if val not in {"grpc", "rest"}:
+        logger.warning(
+            "[GoogleChat] unknown pubsub_transport %r; using grpc", raw
+        )
+        return "grpc"
+    return val
+
+
+def _resolve_http_client(extra: Optional[Dict[str, Any]] = None) -> str:
+    """Return ``httplib2`` (default) or ``requests`` for Chat REST execute().
+
+    ``requests`` honors HTTPS_PROXY without PySocks. Override with
+    ``platforms.google_chat.http_client`` or ``GOOGLE_CHAT_HTTP_CLIENT``.
+    """
+    raw = (
+        (extra or {}).get("http_client")
+        or os.getenv("GOOGLE_CHAT_HTTP_CLIENT")
+        or "httplib2"
+    )
+    val = str(raw).strip().lower()
+    if val not in {"httplib2", "requests"}:
+        logger.warning(
+            "[GoogleChat] unknown http_client %r; using httplib2", raw
+        )
+        return "httplib2"
+    return val
+
+
+class _EnvProxyHttp:
+    """httplib2-compatible client that uses requests (honors HTTPS_PROXY).
+
+    httplib2 only applies HTTP_PROXY when PySocks is installed; otherwise
+    ProxyInfo.isgood() is falsy and it DNS-resolves chat.googleapis.com
+    without going through an intercepting proxy.
+    """
+
+    def request(
+        self,
+        uri,
+        method="GET",
+        body=None,
+        headers=None,
+        redirections=5,
+        connection_type=None,
+        **kwargs,
+    ):
+        import requests
+        from httplib2 import Response
+
+        r = requests.request(
+            method=method,
+            url=uri,
+            data=body,
+            headers=headers or {},
+            timeout=30,
+            allow_redirects=bool(redirections),
+        )
+        resp = Response(dict(r.headers))
+        resp.status = r.status_code
+        resp.reason = r.reason
+        return resp, r.content
+
+
+class _RestPubsubMessage:
+    """Stand-in for streaming_pull Message when using unary REST Pull."""
+
+    def __init__(self, subscriber, subscription_path, received):
+        self._subscriber = subscriber
+        self._subscription_path = subscription_path
+        self._ack_id = received.ack_id
+        msg = received.message
+        self.data = msg.data
+        self.attributes = dict(msg.attributes or {})
+
+    def ack(self) -> None:
+        self._subscriber.acknowledge(
+            request={
+                "subscription": self._subscription_path,
+                "ack_ids": [self._ack_id],
+            }
+        )
+
+    def nack(self) -> None:
+        self._subscriber.modify_ack_deadline(
+            request={
+                "subscription": self._subscription_path,
+                "ack_ids": [self._ack_id],
+                "ack_deadline_seconds": 0,
+            }
+        )
+
+
 class GoogleChatAdapter(BasePlatformAdapter):
     """
     Google Chat bot adapter using Pub/Sub pull + Chat REST API.
@@ -636,6 +740,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
       GOOGLE_CHAT_HOME_CHANNEL
       GOOGLE_CHAT_MAX_MESSAGES (FlowControl, default 1)
       GOOGLE_CHAT_MAX_BYTES    (FlowControl, default 16_777_216 = 16 MiB)
+      GOOGLE_CHAT_PUBSUB_TRANSPORT  grpc (default streaming_pull) or rest
+      GOOGLE_CHAT_HTTP_CLIENT       httplib2 (default) or requests
+      GOOGLE_CHAT_ACCESS_TOKEN / GCP_SA_ACCESS_TOKEN  bearer for Chat+Pub/Sub
     """
 
     MAX_MESSAGE_LENGTH = _MAX_TEXT_LENGTH
@@ -745,6 +852,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
             self._max_bytes = int(os.getenv("GOOGLE_CHAT_MAX_BYTES", str(16 * 1024 * 1024)))
         except (ValueError, TypeError):
             self._max_bytes = 16 * 1024 * 1024
+        self._pubsub_transport = _resolve_pubsub_transport(self.config.extra)
+        self._http_client = _resolve_http_client(self.config.extra)
         self._http_events_url = (
             self.config.extra.get("http_events_url")
             or os.getenv("GOOGLE_CHAT_HTTP_EVENTS_URL", "")
@@ -808,6 +917,20 @@ class GoogleChatAdapter(BasePlatformAdapter):
             return service_account.Credentials.from_service_account_info(
                 info, scopes=_CHAT_SCOPES
             )
+
+        # Pre-minted bearer (e.g. an intercepting proxy that rewrites the
+        # placeholder at egress). Does not replace ADC when unset.
+        sa_token = (
+            os.getenv("GOOGLE_CHAT_ACCESS_TOKEN")
+            or os.getenv("GCP_SA_ACCESS_TOKEN")
+        )
+        if sa_token:
+            from google.oauth2.credentials import Credentials as _OAuthCreds
+            logger.info(
+                "[GoogleChat] Using GOOGLE_CHAT_ACCESS_TOKEN / "
+                "GCP_SA_ACCESS_TOKEN bearer"
+            )
+            return _OAuthCreds(token=sa_token)
 
         # No explicit SA configured — try ADC. This is the Cloud Run / GCE
         # path; google-auth picks up the workload identity automatically.
@@ -1085,7 +1208,15 @@ class GoogleChatAdapter(BasePlatformAdapter):
 
         if subscription_path is not None:
             # Sanity check: subscription exists / SA has access.
-            self._subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+            # Default is gRPC streaming_pull. REST unary Pull is opt-in for
+            # environments that cannot MITM HTTP/2 (e.g. TLS-intercepting proxies).
+            client_kwargs: Dict[str, Any] = {}
+            if self._pubsub_transport == "rest":
+                client_kwargs["transport"] = "rest"
+                logger.info("[GoogleChat] Pub/Sub client transport=rest")
+            self._subscriber = pubsub_v1.SubscriberClient(
+                credentials=credentials, **client_kwargs
+            )
             try:
                 await asyncio.to_thread(
                     lambda: self._subscriber.get_subscription(
@@ -1130,8 +1261,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if subscription_path is not None:
             # Start the supervisor task that runs the Pub/Sub pull with exponential
             # backoff + jitter on transient errors, bails out after N retries.
-            self._supervisor_task = asyncio.create_task(self._run_supervisor())
-            inbound = "pubsub"
+            if self._pubsub_transport == "rest":
+                self._supervisor_task = asyncio.create_task(
+                    self._run_supervisor_rest()
+                )
+                inbound = "pubsub-rest"
+            else:
+                self._supervisor_task = asyncio.create_task(self._run_supervisor())
+                inbound = "pubsub"
         else:
             self._supervisor_task = None
             inbound = "http"
@@ -1242,6 +1379,83 @@ class GoogleChatAdapter(BasePlatformAdapter):
                     self._RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
                 )
                 # Full jitter: pick uniformly in [0, delay].
+                sleep_for = random.uniform(0, delay)
+                try:
+                    await asyncio.sleep(sleep_for)
+                except asyncio.CancelledError:
+                    return
+
+    async def _run_supervisor_rest(self) -> None:
+        """Unary REST Pull loop (GOOGLE_CHAT_PUBSUB_TRANSPORT=rest).
+
+        Same reconnect/fatal policy as streaming_pull. Used when gRPC/h2
+        cannot pass through a TLS intercepting proxy.
+        """
+        attempt = 0
+        while not self._shutting_down:
+            try:
+                def _pull():
+                    return self._subscriber.pull(
+                        request={
+                            "subscription": self._subscription_path,
+                            "max_messages": max(1, int(self._max_messages or 1)),
+                        },
+                        timeout=25.0,
+                    )
+
+                try:
+                    resp = await asyncio.to_thread(_pull)
+                except gax_exceptions.DeadlineExceeded:
+                    attempt = 0
+                    continue
+                received_list = list(getattr(resp, "received_messages", None) or [])
+                if not received_list:
+                    attempt = 0
+                    continue
+                for received in received_list:
+                    wrapper = _RestPubsubMessage(
+                        self._subscriber,
+                        self._subscription_path,
+                        received,
+                    )
+                    await asyncio.to_thread(self._on_pubsub_message, wrapper)
+                attempt = 0
+            except asyncio.CancelledError:
+                return
+            except gax_exceptions.Unauthenticated:
+                self._set_fatal_error(
+                    code="pubsub_auth",
+                    message="Pub/Sub authentication failed (SA key invalid/revoked)",
+                    retryable=False,
+                )
+                return
+            except gax_exceptions.PermissionDenied:
+                self._set_fatal_error(
+                    code="pubsub_permission",
+                    message="SA lacks pubsub.subscriber on the subscription",
+                    retryable=False,
+                )
+                return
+            except Exception as exc:
+                attempt += 1
+                msg = _redact_sensitive(str(exc))
+                logger.warning(
+                    "[GoogleChat] Pub/Sub REST pull failed (attempt %d/%d): %s",
+                    attempt,
+                    self._MAX_RECONNECT_ATTEMPTS,
+                    msg,
+                )
+                if attempt >= self._MAX_RECONNECT_ATTEMPTS:
+                    self._set_fatal_error(
+                        code="pubsub_reconnect_exhausted",
+                        message=f"Pub/Sub reconnect failed {attempt} times; giving up",
+                        retryable=False,
+                    )
+                    return
+                delay = min(
+                    self._RECONNECT_MAX_DELAY,
+                    self._RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
+                )
                 sleep_for = random.uniform(0, delay)
                 try:
                     await asyncio.sleep(sleep_for)
@@ -2532,7 +2746,13 @@ class GoogleChatAdapter(BasePlatformAdapter):
         shares SSL state between calls. Passing a fresh http= to each
         ``execute()`` avoids record-layer failures when calls run in
         ``asyncio.to_thread`` workers. Cheap (~no network).
+
+        Default remains httplib2. Set ``GOOGLE_CHAT_HTTP_CLIENT=requests``
+        (or ``http_client: requests``) when HTTPS_PROXY must be honoured
+        without PySocks.
         """
+        if self._http_client == "requests":
+            return AuthorizedHttp(self._credentials, http=_EnvProxyHttp())
         return AuthorizedHttp(self._credentials, http=httplib2.Http(timeout=30))
 
     async def _call_with_retry(
@@ -3420,6 +3640,12 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     )
     if sa_json:
         seed["service_account_json"] = sa_json
+    pubsub_transport = os.getenv("GOOGLE_CHAT_PUBSUB_TRANSPORT")
+    if pubsub_transport:
+        seed["pubsub_transport"] = pubsub_transport
+    http_client = os.getenv("GOOGLE_CHAT_HTTP_CLIENT")
+    if http_client:
+        seed["http_client"] = http_client
     home = os.getenv("GOOGLE_CHAT_HOME_CHANNEL")
     if home:
         seed["home_channel"] = {

@@ -48,3 +48,15 @@ optional_env:
     description: "Default space for cron / notification delivery (e.g. spaces/AAAA...)."
     prompt: "Home space ID (or empty)"
     password: false
+  - name: GOOGLE_CHAT_PUBSUB_TRANSPORT
+    description: "Pub/Sub inbound transport. grpc (default, streaming_pull) or rest (unary HTTPS Pull for TLS-intercepting proxies)."
+    prompt: "Pub/Sub transport (grpc or rest)"
+    password: false
+  - name: GOOGLE_CHAT_HTTP_CLIENT
+    description: "HTTP client for Chat REST execute(). httplib2 (default) or requests (honors HTTPS_PROXY without PySocks)."
+    prompt: "Chat HTTP client (httplib2 or requests)"
+    password: false
+  - name: GOOGLE_CHAT_ACCESS_TOKEN
+    description: "Optional pre-minted bearer for Chat + Pub/Sub. Alias: GCP_SA_ACCESS_TOKEN. Leave empty to use SA JSON or ADC."
+    prompt: "Access token (or empty)"
+    password: true

@@ -1586,6 +1586,88 @@ class TestSupervisorReconnect:
         assert adapter.fatal_error_code == "pubsub_reconnect_exhausted"
 
 
+class TestPubsubTransportConfig:
+    def test_default_is_grpc(self, adapter):
+        assert adapter._pubsub_transport == "grpc"
+        assert adapter._http_client == "httplib2"
+
+    def test_extra_selects_rest(self):
+        cfg = _base_config(pubsub_transport="rest", http_client="requests")
+        a = GoogleChatAdapter(cfg)
+        assert a._pubsub_transport == "rest"
+        assert a._http_client == "requests"
+
+    def test_unknown_falls_back_to_grpc(self):
+        cfg = _base_config(pubsub_transport="h2")
+        a = GoogleChatAdapter(cfg)
+        assert a._pubsub_transport == "grpc"
+
+    def test_env_selects_rest(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_CHAT_PUBSUB_TRANSPORT", "rest")
+        monkeypatch.setenv("GOOGLE_CHAT_HTTP_CLIENT", "requests")
+        a = GoogleChatAdapter(_base_config())
+        assert a._pubsub_transport == "rest"
+        assert a._http_client == "requests"
+
+    @pytest.mark.asyncio
+    async def test_connect_grpc_does_not_pass_rest_transport(
+        self, tmp_path, monkeypatch
+    ):
+        cfg = _base_config(service_account_json="{}")
+        a = GoogleChatAdapter(cfg)
+        a._thread_count_store._path = tmp_path / "google_chat_thread_counts.json"
+        captured = {}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def get_subscription(self, request=None):
+                return None
+
+        monkeypatch.setattr(_gc_mod, "_load_google_modules", lambda: True)
+        monkeypatch.setattr(a, "_load_sa_credentials", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(_gc_mod, "build_service", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(_gc_mod, "pubsub_v1", MagicMock(SubscriberClient=_Client))
+        a._resolve_bot_user_id = AsyncMock(return_value=None)
+        a._run_supervisor = AsyncMock()
+        a._run_supervisor_rest = AsyncMock()
+
+        assert await a.connect() is True
+        assert "transport" not in captured["kwargs"]
+        a._run_supervisor.assert_called_once()
+        a._run_supervisor_rest.assert_not_called()
+        await a.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_rest_passes_transport(self, tmp_path, monkeypatch):
+        cfg = _base_config(pubsub_transport="rest", service_account_json="{}")
+        a = GoogleChatAdapter(cfg)
+        a._thread_count_store._path = tmp_path / "google_chat_thread_counts.json"
+        captured = {}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def get_subscription(self, request=None):
+                return None
+
+        monkeypatch.setattr(_gc_mod, "_load_google_modules", lambda: True)
+        monkeypatch.setattr(a, "_load_sa_credentials", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(_gc_mod, "build_service", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(_gc_mod, "pubsub_v1", MagicMock(SubscriberClient=_Client))
+        a._resolve_bot_user_id = AsyncMock(return_value=None)
+        a._run_supervisor = AsyncMock()
+        a._run_supervisor_rest = AsyncMock()
+
+        assert await a.connect() is True
+        assert captured["kwargs"].get("transport") == "rest"
+        a._run_supervisor_rest.assert_called_once()
+        a._run_supervisor.assert_not_called()
+        await a.disconnect()
+
+
 # ===========================================================================
 # Authorization: email-path check via user_id_alt
 # ===========================================================================
