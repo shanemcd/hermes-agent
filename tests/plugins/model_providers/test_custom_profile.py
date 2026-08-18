@@ -107,3 +107,26 @@ class TestCustomReasoningWithNumCtx:
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
 
+
+class TestCustomVertexOpenAPIThinking:
+    VERTEX = (
+        "https://aiplatform.googleapis.com/v1beta1/projects/demo/"
+        "locations/global/endpoints/openapi"
+    )
+
+    def test_emits_google_thinking_config_for_vertex_gemini(self, custom_profile):
+        eb, _tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            model="google/gemini-3.6-flash",
+            base_url=self.VERTEX,
+        )
+        assert eb["google"]["thinking_config"]["include_thoughts"] is True
+
+    def test_skips_thinking_config_for_non_vertex_custom(self, custom_profile):
+        eb, _tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            model="google/gemini-3.6-flash",
+            base_url="http://localhost:11434/v1",
+        )
+        assert "google" not in eb
+

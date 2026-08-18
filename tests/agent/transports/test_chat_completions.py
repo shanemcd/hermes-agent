@@ -84,6 +84,29 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    def test_convert_messages_strips_gemini_tool_call_thought_content(self, transport):
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "thinking about the tool",
+                "tool_calls": [{"id": "1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+            }
+        ]
+        result = transport.convert_messages(msgs, model="google/gemini-3.6-flash")
+        assert result[0]["content"] == ""
+        assert result[0]["reasoning"] == "thinking about the tool"
+        assert result is not msgs
+
+    def test_convert_messages_keeps_non_gemini_tool_call_content(self, transport):
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "calling a tool",
+                "tool_calls": [{"id": "1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+            }
+        ]
+        assert transport.convert_messages(msgs, model="gpt-4o") is msgs
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 

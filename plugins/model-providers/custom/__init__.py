@@ -30,6 +30,7 @@ class CustomProfile(ProviderProfile):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
+        thinking_disabled = False
 
         # Ollama context window
         if ollama_num_ctx:
@@ -55,6 +56,7 @@ class CustomProfile(ProviderProfile):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
+                thinking_disabled = True
                 # Ollama's /v1/chat/completions silently ignores
                 # extra_body.think (only /api/chat honours it — ollama#14820)
                 # but respects the top-level reasoning_effort field, so both
@@ -65,6 +67,29 @@ class CustomProfile(ProviderProfile):
                 extra_body["think"] = False
             elif _effort:
                 top_level["reasoning_effort"] = _effort
+
+        # Vertex OpenAPI behind provider=custom never goes through VertexProfile,
+        # so Gemini hides thought parts unless we emit thinking_config here.
+        model = ctx.get("model") or ""
+        base_url = str(ctx.get("base_url") or self.base_url or "")
+        if (
+            not thinking_disabled
+            and "aiplatform.googleapis.com" in base_url
+            and "gemini" in str(model).lower()
+        ):
+            from agent.transports.chat_completions import (
+                _build_gemini_thinking_config,
+                _snake_case_gemini_thinking_config,
+            )
+
+            rc = reasoning_config if isinstance(reasoning_config, dict) else {
+                "enabled": True,
+                "effort": "medium",
+            }
+            raw = _build_gemini_thinking_config(model, rc)
+            thinking = _snake_case_gemini_thinking_config(raw)
+            if thinking:
+                extra_body["google"] = {"thinking_config": thinking}
 
         return extra_body, top_level
 

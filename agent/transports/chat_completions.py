@@ -318,6 +318,17 @@ class ChatCompletionsTransport(ProviderTransport):
                 ):
                     needs_sanitize = True
                     break
+                if (
+                    msg.get("role") == "assistant"
+                    and tool_calls
+                    and isinstance(msg.get("content"), str)
+                    and msg.get("content")
+                    and not strip_extra_content
+                ):
+                    # Gemini thought prose in content next to tool_calls 400s
+                    # Vertex OpenAPI on the follow-up turn.
+                    needs_sanitize = True
+                    break
                 for tc in tool_calls:
                     if isinstance(tc, dict) and (
                         "call_id" in tc
@@ -396,6 +407,17 @@ class ChatCompletionsTransport(ProviderTransport):
                     out_msg = mutable_msg()
                     out_msg.pop("tool_calls", None)
                     continue
+                if (
+                    msg.get("role") == "assistant"
+                    and tool_calls
+                    and isinstance(msg.get("content"), str)
+                    and msg.get("content")
+                    and not strip_extra_content
+                ):
+                    out_msg = mutable_msg()
+                    if not out_msg.get("reasoning"):
+                        out_msg["reasoning"] = out_msg["content"]
+                    out_msg["content"] = ""
                 copied_tool_calls: list[Any] | None = None
                 for tc_idx, tc in enumerate(tool_calls):
                     if isinstance(tc, dict):
