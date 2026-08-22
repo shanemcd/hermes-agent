@@ -244,9 +244,14 @@ When the agent asks a multiple-choice clarify question, the adapter renders it
 as a native **Card v2** with one button per choice plus an
 **"Other / type answer"** button, instead of a plain numbered text list.
 Clicking a button answers the question directly (`CARD_CLICKED` events route
-the choice back into the waiting session). If the card fails to send, or the
-question has no fixed choices, the adapter falls back to the standard text
-clarify. No configuration needed.
+the choice back into the waiting session). **This requires HTTP event
+delivery** (`GOOGLE_CHAT_HTTP_EVENTS_URL`). Chat apps that receive events
+only via Pub/Sub cannot return a synchronous ActionResponse, so Google Chat
+shows "unable to process your request" and the click is dropped. In Pub/Sub
+mode Hermes falls back to a numbered text list — reply with `1`, `2`, or
+the option text.
+If the card fails to send, or the question has no fixed choices, the adapter
+falls back to the standard text clarify. No configuration needed.
 
 ---
 

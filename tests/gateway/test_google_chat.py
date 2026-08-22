@@ -132,8 +132,11 @@ _gc_mod.GOOGLE_CHAT_AVAILABLE = True
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome  # noqa: E402
 from plugins.platforms.google_chat.adapter import (  # noqa: E402
     GoogleChatAdapter,
+    _REST_PUBSUB_HTTP_TIMEOUT,
     _is_google_owned_host,
+    _is_rest_pull_idle_timeout,
     _mime_for_message_type,
+    _pin_rest_session_timeout,
     _redact_sensitive,
     check_google_chat_requirements,
 )
@@ -723,6 +726,29 @@ class TestBuildMessageEvent:
         assert event.source.chat_type == "group"
         assert event.source.thread_id == "spaces/G/threads/T1"
 
+    @pytest.mark.asyncio
+    async def test_file_only_failed_download_is_not_empty_user_turn(self, adapter):
+        """A Chat file upload has empty text. If media.download fails
+        (httplib2 DNS / no proxy), do not dispatch ``text=''`` — Vertex
+        Gemini 3.x then 400s 'Requests ending with a model turn'."""
+        env = _make_chat_envelope(text="", thread_name="spaces/S/threads/T1")
+        msg = env["chat"]["messagePayload"]["message"]
+        msg["text"] = ""
+        msg["attachment"] = [{
+            "source": "DRIVE_FILE",
+            "contentType": "application/pdf",
+            "name": "spaces/S/messages/M/attachments/A",
+            "attachmentDataRef": {
+                "resourceName": "spaces/S/messages/M/attachments/A",
+            },
+        }]
+        adapter._download_attachment = AsyncMock(side_effect=OSError("dns"))
+        event = await adapter._build_message_event(msg, env)
+        assert event is not None
+        assert event.text
+        assert "could not download" in event.text.lower()
+        assert not event.media_urls
+
 
 # ===========================================================================
 # send() — text, patch-in-place, chunking, error handling
@@ -807,6 +833,7 @@ class TestSend:
             )()
         )
 
+        adapter._http_events_url = "https://example.test/google-chat/events"
         result = await adapter.send_clarify(
             "spaces/S",
             "Pick a demo",
@@ -825,6 +852,96 @@ class TestSend:
         assert {"key": "choice", "value": "Simple"} in buttons[0]["onClick"]["action"]["parameters"]
         assert buttons[-1]["text"] == "Other / type answer"
         assert adapter._clarify_state["clarify123"] == "session-key"
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_pubsub_falls_back_to_text(self, adapter):
+        adapter._http_events_url = ""
+        adapter.send = AsyncMock(
+            return_value=type(
+                "R", (), {"success": True, "message_id": "m/1", "error": None}
+            )()
+        )
+        result = await adapter.send_clarify(
+            "spaces/S",
+            "Pick a demo",
+            ["Simple", "Capability test"],
+            "clarify123",
+            "session-key",
+        )
+        assert result.success is True
+        text = adapter.send.await_args.kwargs["content"]
+        assert "1. Simple" in text
+        assert adapter._clarify_state == {}
+
+    @pytest.mark.asyncio
+    async def test_card_clicked_resolves_clarify(self, adapter):
+        from tools import clarify_gateway as cg
+
+        cg.register(
+            "cid1", "session-key", "Pick a demo", ["Simple", "Capability test"]
+        )
+        adapter._clarify_state["cid1"] = "session-key"
+        envelope = {
+            "type": "CARD_CLICKED",
+            "action": {
+                "actionMethodName": "hermes_clarify",
+                "parameters": [
+                    {"key": "clarify_id", "value": "cid1"},
+                    {"key": "choice", "value": "Simple"},
+                ],
+            },
+            "space": {"name": "spaces/S"},
+        }
+        click = adapter._extract_card_click(envelope)
+        assert click is not None
+        assert click["params"]["choice"] == "Simple"
+        scheduled = []
+
+        def _capture(coro):
+            scheduled.append(coro)
+
+        msg = _make_pubsub_message(envelope)
+        with patch.object(adapter, "_submit_on_loop", side_effect=_capture):
+            adapter._on_pubsub_message(msg)
+        msg.ack.assert_called_once()
+        assert len(scheduled) == 1
+        await scheduled[0]
+        assert cg.wait_for_response("cid1", timeout=0.1) == "Simple"
+        assert "cid1" not in adapter._clarify_state
+
+    @pytest.mark.asyncio
+    async def test_http_card_clicked_returns_action_response(self, adapter):
+        from tools import clarify_gateway as cg
+
+        cg.register("cid2", "sk", "Q", ["A", "B"])
+        envelope = {
+            "type": "CARD_CLICKED",
+            "common": {
+                "invokedFunction": "hermes_clarify",
+                "parameters": {"clarify_id": "cid2", "choice": "B"},
+            },
+        }
+        result = await adapter.dispatch_http_event(envelope)
+        assert result == {"actionResponse": {"type": "UPDATE_MESSAGE"}}
+        assert cg.wait_for_response("cid2", timeout=0.1) == "B"
+
+    def test_typed_message_with_common_event_object_is_not_a_card_click(self, adapter):
+        """Workspace Add-ons attach commonEventObject to MESSAGE events."""
+        envelope = _make_chat_envelope(text="2")
+        envelope["commonEventObject"] = {"hostApp": "CHAT", "parameters": {}}
+        envelope["common"] = {"hostApp": "CHAT"}
+        assert adapter._extract_card_click(
+            envelope,
+            ce_type="google.workspace.chat.message.v1.created",
+        ) is None
+        msg = _make_pubsub_message(
+            envelope,
+            attributes={"ce-type": "google.workspace.chat.message.v1.created"},
+        )
+        with patch.object(adapter, "_submit_on_loop") as submit:
+            adapter._on_pubsub_message(msg)
+        submit.assert_called_once()
+        msg.ack.assert_called_once()
 
 
 # ===========================================================================
@@ -1345,6 +1462,94 @@ class TestAttachmentSSRFGuard:
         assert path == str(tmp_path / "out.pdf")
         assert mime == "application/pdf"
 
+    @pytest.mark.asyncio
+    async def test_media_download_binds_authed_http(self, adapter):
+        """MediaIoBaseDownload must use _new_authed_http, not the
+        discovery client's default httplib2 (no HTTPS_PROXY)."""
+        attachment = {
+            "contentType": "application/pdf",
+            "name": "spaces/S/messages/M/attachments/A",
+            "attachmentDataRef": {
+                "resourceName": "spaces/S/messages/M/attachments/A",
+            },
+        }
+        req = MagicMock()
+        adapter._chat_api = MagicMock()
+        adapter._chat_api.media.return_value.download_media.return_value = req
+        authed = object()
+        adapter._new_authed_http = MagicMock(return_value=authed)
+
+        class _FakeDownloader:
+            def __init__(self, buf, request):
+                self.buf = buf
+                self.request = request
+
+            def next_chunk(self):
+                self.buf.write(b"%PDF-ok")
+                return None, True
+
+        captured = {}
+
+        async def _run_thread(fn, *args, **kwargs):
+            result = fn(*args, **kwargs)
+            captured["http"] = req.http
+            return result
+
+        with patch(
+            "googleapiclient.http.MediaIoBaseDownload",
+            _FakeDownloader,
+        ), patch("asyncio.to_thread", _run_thread):
+            from plugins.platforms.google_chat import adapter as gc_mod
+            with patch.object(
+                gc_mod, "cache_document_from_bytes",
+                lambda data, filename=None: "/tmp/out.pdf",
+            ):
+                path, mime = await adapter._download_attachment(attachment)
+
+        assert captured["http"] is authed
+        assert path == "/tmp/out.pdf"
+        assert mime == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_media_dns_failure_falls_through_to_download_uri(
+        self, adapter, monkeypatch,
+    ):
+        """gaierror from httplib2 is not HttpError; still try downloadUri
+        (requests honors HTTPS_PROXY)."""
+        attachment = {
+            "contentType": "text/plain",
+            "name": "spaces/S/messages/M/attachments/A",
+            "attachmentDataRef": {
+                "resourceName": "spaces/S/messages/M/attachments/A",
+            },
+            "downloadUri": "https://chat.google.com/file",
+        }
+
+        names = []
+
+        async def _to_thread(fn, *args, **kwargs):
+            names.append(getattr(fn, "__name__", ""))
+            if getattr(fn, "__name__", "") == "_fetch_uri":
+                return b"hello"
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        adapter._chat_api = MagicMock()
+        adapter._chat_api.media.return_value.download_media.side_effect = (
+            OSError("Temporary failure in name resolution")
+        )
+        adapter._new_authed_http = MagicMock()
+        from plugins.platforms.google_chat import adapter as gc_mod
+        monkeypatch.setattr(
+            gc_mod, "cache_document_from_bytes",
+            lambda data, filename=None: "/tmp/hello.txt",
+        )
+
+        path, mime = await adapter._download_attachment(attachment)
+        assert names == ["_fetch_media", "_fetch_uri"]
+        assert path == "/tmp/hello.txt"
+        assert mime == "text/plain"
+
 
 # ===========================================================================
 # Outbound thread routing (anti-top-level fallback in DMs)
@@ -1736,6 +1941,72 @@ class TestPubsubTransportConfig:
         a._run_supervisor_rest.assert_called_once()
         a._run_supervisor.assert_not_called()
         await a.disconnect()
+
+
+class TestRestPubsubHttpTimeout:
+    def test_idle_timeout_matches_requests_and_gapic_names(self):
+        assert _is_rest_pull_idle_timeout(TimeoutError("read timed out"))
+        assert _is_rest_pull_idle_timeout(type("DeadlineExceeded", (Exception,), {})())
+        assert _is_rest_pull_idle_timeout(type("ReadTimeout", (Exception,), {})())
+        assert not _is_rest_pull_idle_timeout(RuntimeError("stream died"))
+        assert not _is_rest_pull_idle_timeout(type("ProxyError", (Exception,), {})())
+
+    def test_pin_rest_session_timeout_mounts_adapter(self):
+        session = MagicMock()
+        subscriber = MagicMock()
+        subscriber.transport = MagicMock(_session=session)
+        subscriber._transport = None
+        _pin_rest_session_timeout(subscriber, timeout=12.5)
+        assert session.mount.call_count == 2
+        https_adapter = session.mount.call_args_list[0][0][1]
+        assert https_adapter.hermes_timeout == 12.5
+
+    @pytest.mark.asyncio
+    async def test_rest_pull_passes_retry_none_and_http_timeout(
+        self, adapter, monkeypatch
+    ):
+        captured = {}
+        pulls = {"n": 0}
+
+        def _pull(**kwargs):
+            captured.update(kwargs)
+            pulls["n"] += 1
+            adapter._shutting_down = True
+            resp = MagicMock()
+            resp.received_messages = []
+            return resp
+
+        adapter._subscriber = MagicMock()
+        adapter._subscriber.pull = _pull
+        adapter._subscription_path = "projects/p/subscriptions/s"
+        await adapter._run_supervisor_rest()
+        assert captured.get("retry") is None
+        assert captured.get("timeout") == _REST_PUBSUB_HTTP_TIMEOUT
+        assert pulls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_rest_pull_timeout_is_idle_not_fatal(self, adapter, monkeypatch):
+        async def _instant(*_a, **_kw):
+            return None
+
+        monkeypatch.setattr(
+            "plugins.platforms.google_chat.adapter.asyncio.sleep", _instant
+        )
+        pulls = {"n": 0}
+
+        def _pull(**kwargs):
+            pulls["n"] += 1
+            if pulls["n"] >= 3:
+                adapter._shutting_down = True
+            raise TimeoutError("HTTPSConnectionPool read timed out")
+
+        adapter._subscriber = MagicMock()
+        adapter._subscriber.pull = _pull
+        adapter._subscription_path = "projects/p/subscriptions/s"
+        adapter._MAX_RECONNECT_ATTEMPTS = 2
+        await adapter._run_supervisor_rest()
+        assert pulls["n"] >= 3
+        assert not adapter.has_fatal_error
 
 
 # ===========================================================================

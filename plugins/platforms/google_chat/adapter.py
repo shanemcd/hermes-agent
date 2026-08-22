@@ -1,10 +1,13 @@
 """Google Chat platform adapter.
 
-Inbound: authenticated HTTP callbacks or a Cloud Pub/Sub pull subscription. Outbound:
-Chat REST API (synchronous googleapiclient via ``asyncio.to_thread``). The Pub/Sub
+Inbound: authenticated HTTP callbacks or a Cloud Pub/Sub pull subscription
+(gRPC streaming_pull, or opt-in REST unary Pull via ``GOOGLE_CHAT_PUBSUB_TRANSPORT=rest``).
+Outbound: Chat REST API (synchronous googleapiclient via ``asyncio.to_thread``). The Pub/Sub
 callback runs on a background thread, so ``handle_message`` is scheduled thread-safely
 onto the loop and never awaited there. Only MESSAGE events reach the agent; membership
-events cache the bot id, card clicks are ACK'd only.
+events cache the bot id, card clicks are ACK'd only. CARD_CLICKED resolves pending
+``clarify`` prompts (``hermes_clarify`` actions) — only when HTTP events are configured,
+since Pub/Sub Chat apps cannot return a synchronous ActionResponse.
 """
 
 from __future__ import annotations
@@ -382,6 +385,71 @@ def _resolve_http_client(extra: Optional[Dict[str, Any]] = None) -> str:
     return val
 
 
+_REST_PUBSUB_HTTP_TIMEOUT = 25.0
+
+
+def _is_rest_pull_idle_timeout(exc: BaseException) -> bool:
+    """True when a REST Pull failed because the client/server wait expired.
+
+    Empty long-polls are normal — they must not count toward reconnect
+    exhaustion. Match by type and by class name so google-api-core remaps
+    and requests/urllib3 timeouts all count as idle.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    name = type(exc).__name__
+    if name in {
+        "DeadlineExceeded",
+        "Timeout",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "ReadTimeoutError",
+        "ConnectTimeoutError",
+    }:
+        return True
+    return "Timeout" in name and "Proxy" not in name
+
+
+def _rest_transport_session(subscriber: Any) -> Any:
+    for attr in ("transport", "_transport"):
+        transport = getattr(subscriber, attr, None)
+        if transport is None:
+            continue
+        session = getattr(transport, "_session", None)
+        if session is not None:
+            return session
+    return None
+
+
+def _pin_rest_session_timeout(
+    subscriber: Any, timeout: float = _REST_PUBSUB_HTTP_TIMEOUT
+) -> None:
+    """Force connect+read timeout on the gapic REST ``AuthorizedSession``.
+
+    ``HTTPAdapter.send`` is the last place kwargs hit urllib3; overriding
+    ``timeout`` here wins even when gapic passes ``timeout=None``.
+    """
+    session = _rest_transport_session(subscriber)
+    if session is None or not hasattr(session, "mount"):
+        return
+    try:
+        from requests.adapters import HTTPAdapter
+    except ImportError:
+        return
+
+    class _PinnedTimeoutHTTPAdapter(HTTPAdapter):
+        hermes_timeout = timeout
+
+        def send(self, request, stream=False, timeout=None, **kwargs):
+            return super().send(
+                request, stream=stream, timeout=self.hermes_timeout, **kwargs
+            )
+
+    adapter = _PinnedTimeoutHTTPAdapter()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+
 class _EnvProxyHttp:
     """httplib2-compatible client that uses requests (honors HTTPS_PROXY).
 
@@ -530,6 +598,31 @@ class GoogleChatAdapter(BasePlatformAdapter):
         gateway in GCP without managing SA key files. Pattern lifted from PR #14965.
         """
         sa_path = self.config.extra.get("service_account_json") or _get_scoped_secret("GOOGLE_APPLICATION_CREDENTIALS")
+        # Pre-minted bearer (e.g. an intercepting proxy that rewrites the
+        # placeholder at egress). Does not replace an explicit SA config when
+        # unset. Checked BEFORE the SA/ADC path so the OpenShell placeholder
+        # never trips the ADC borrow guard in _load_sa_credentials_from.
+        if not sa_path:
+            sa_token = (
+                os.getenv("GOOGLE_CHAT_ACCESS_TOKEN")
+                or os.getenv("GCP_SA_ACCESS_TOKEN")
+            )
+            if sa_token:
+                from datetime import datetime, timedelta, timezone
+                from google.oauth2.credentials import Credentials as _OAuthCreds
+                logger.info(
+                    "[GoogleChat] Using GOOGLE_CHAT_ACCESS_TOKEN / "
+                    "GCP_SA_ACCESS_TOKEN bearer"
+                )
+                # OpenShell placeholders are not JWTs. google-auth treats a
+                # token with no expiry as stale and tries to refresh, which
+                # 400s with "necessary fields need to refresh". Stamp a far
+                # expiry so the bearer is sent as-is for proxy rewrite.
+                return _OAuthCreds(
+                    token=sa_token,
+                    expiry=datetime.now(timezone.utc).replace(tzinfo=None)
+                    + timedelta(days=3650),
+                )
         try:
             credentials = _load_sa_credentials_from(sa_path)
         except _SACredentialError as err:
@@ -679,7 +772,15 @@ class GoogleChatAdapter(BasePlatformAdapter):
             gax_exceptions.PermissionDenied: (
                 "subscription_permission", "Service Account lacks roles/pubsub.subscriber on the subscription"),
         }
-        self._subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+        # Default is gRPC streaming_pull. REST unary Pull is opt-in for
+        # environments that cannot MITM HTTP/2 (e.g. TLS-intercepting proxies).
+        client_kwargs: Dict[str, Any] = {}
+        if self._pubsub_transport == "rest":
+            client_kwargs["transport"] = "rest"
+            logger.info("[GoogleChat] Pub/Sub client transport=rest")
+        self._subscriber = pubsub_v1.SubscriberClient(credentials=credentials, **client_kwargs)
+        if self._pubsub_transport == "rest":
+            _pin_rest_session_timeout(self._subscriber, _REST_PUBSUB_HTTP_TIMEOUT)
         try:
             await asyncio.to_thread(lambda: self._subscriber.get_subscription(request={"subscription": subscription_path}))
         except (gax_exceptions.NotFound, gax_exceptions.PermissionDenied) as exc:
@@ -724,7 +825,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 self._save_cached_bot_id(self._bot_user_id)
             else:
                 logger.info("[GoogleChat] bot_user_id not yet resolved; will resolve on first addedToSpace or member lookup")
-        self._supervisor_task = asyncio.create_task(self._run_supervisor()) if subscription_path is not None else None
+        self._supervisor_task = asyncio.create_task(
+            self._run_supervisor_rest() if self._pubsub_transport == "rest" else self._run_supervisor()
+        ) if subscription_path is not None else None
         self._mark_connected()
         logger.info(
             "[GoogleChat] Connected; project=%s, inbound=%s, subscription=%s, "
@@ -799,6 +902,93 @@ class GoogleChatAdapter(BasePlatformAdapter):
                     return
 
     # -- inbound (Pub/Sub callback runs in a thread) -------------------------
+    async def _run_supervisor_rest(self) -> None:
+        """Unary REST Pull loop (GOOGLE_CHAT_PUBSUB_TRANSPORT=rest).
+
+        Same reconnect/fatal policy as streaming_pull. Used when gRPC/h2
+        cannot pass through a TLS intercepting proxy.
+        """
+        attempt = 0
+        while not self._shutting_down:
+            try:
+                def _pull():
+                    # retry=None: supervisor owns backoff. Gapic's default
+                    # unary retry would wrap a hung REST read rather than
+                    # abort it. HTTP timeout is pinned on the session.
+                    return self._subscriber.pull(
+                        request={
+                            "subscription": self._subscription_path,
+                            "max_messages": max(1, int(self._max_messages or 1)),
+                        },
+                        timeout=_REST_PUBSUB_HTTP_TIMEOUT,
+                        retry=None,
+                    )
+
+                try:
+                    resp = await asyncio.to_thread(_pull)
+                except Exception as exc:
+                    if _is_rest_pull_idle_timeout(exc):
+                        attempt = 0
+                        continue
+                    raise
+                received_list = list(getattr(resp, "received_messages", None) or [])
+                if not received_list:
+                    attempt = 0
+                    continue
+                for received in received_list:
+                    wrapper = _RestPubsubMessage(
+                        self._subscriber,
+                        self._subscription_path,
+                        received,
+                    )
+                    await asyncio.to_thread(self._on_pubsub_message, wrapper)
+                attempt = 0
+            except asyncio.CancelledError:
+                return
+            except gax_exceptions.Unauthenticated:
+                self._set_fatal_error(
+                    code="pubsub_auth",
+                    message="Pub/Sub authentication failed (SA key invalid/revoked)",
+                    retryable=False,
+                )
+                return
+            except gax_exceptions.PermissionDenied:
+                self._set_fatal_error(
+                    code="pubsub_permission",
+                    message="SA lacks pubsub.subscriber on the subscription",
+                    retryable=False,
+                )
+                return
+            except Exception as exc:
+                attempt += 1
+                msg = _redact_sensitive(str(exc))
+                logger.warning(
+                    "[GoogleChat] Pub/Sub REST pull failed (attempt %d/%d): %s",
+                    attempt,
+                    self._MAX_RECONNECT_ATTEMPTS,
+                    msg,
+                )
+                if attempt >= self._MAX_RECONNECT_ATTEMPTS:
+                    self._set_fatal_error(
+                        code="pubsub_reconnect_exhausted",
+                        message=f"Pub/Sub reconnect failed {attempt} times; giving up",
+                        retryable=False,
+                    )
+                    return
+                delay = min(
+                    self._RECONNECT_MAX_DELAY,
+                    self._RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
+                )
+                sleep_for = random.uniform(0, delay)
+                try:
+                    await asyncio.sleep(sleep_for)
+                except asyncio.CancelledError:
+                    return
+
+    # ------------------------------------------------------------------
+    # Inbound event handling (Pub/Sub callback runs in a thread)
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _extract_message_payload(envelope: Dict[str, Any],
                                  ce_type: str = "") -> Optional[Tuple[Dict[str, Any], Dict[str, Any], str]]:
@@ -869,6 +1059,148 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 d["space"] = space
         return msg_with_space, enriched_env
 
+    def _is_card_click_event(envelope: Dict[str, Any], ce_type: str = "") -> bool:
+        """True only for interaction/click events, not ordinary MESSAGE envelopes.
+
+        Workspace Add-ons attach ``commonEventObject`` to *every* Chat event,
+        including typed messages. Treating that as CARD_CLICKED swallowed
+        user text (e.g. a clarify reply of ``2``).
+        """
+        event_type = str(envelope.get("type") or envelope.get("event_type") or "")
+        if "CARD_CLICKED" in event_type.upper():
+            return True
+        ce = (ce_type or "").lower()
+        if "cardclicked" in ce.replace("_", "").replace(".", "") or "widget" in ce:
+            return True
+        chat_block = envelope.get("chat") or {}
+        if isinstance(chat_block, dict) and (
+            chat_block.get("cardClickedPayload") or chat_block.get("widgetPayload")
+        ):
+            return True
+        action = envelope.get("action")
+        if isinstance(action, dict) and (
+            action.get("actionMethodName") or action.get("function")
+        ):
+            return True
+        common = envelope.get("common") or envelope.get("commonEventObject")
+        if isinstance(common, dict) and common.get("invokedFunction"):
+            return True
+        return False
+    def _extract_card_click(
+        envelope: Dict[str, Any], ce_type: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """Parse a CARD_CLICKED / widget payload, or return None."""
+        if not GoogleChatAdapter._is_card_click_event(envelope, ce_type):
+            return None
+
+        chat_block = envelope.get("chat") or {}
+        payload = (
+            chat_block.get("cardClickedPayload")
+            or chat_block.get("widgetPayload")
+            or {}
+        )
+        if not isinstance(payload, dict):
+            payload = {}
+
+        action = envelope.get("action") or payload.get("action") or {}
+        if not isinstance(action, dict):
+            action = {}
+        common = (
+            envelope.get("common")
+            or envelope.get("commonEventObject")
+            or payload.get("common")
+            or {}
+        )
+        if not isinstance(common, dict):
+            common = {}
+
+        function = str(
+            action.get("actionMethodName")
+            or action.get("function")
+            or common.get("invokedFunction")
+            or ""
+        )
+        params: Dict[str, str] = {}
+        raw_params = action.get("parameters")
+        if isinstance(raw_params, list):
+            for item in raw_params:
+                if isinstance(item, dict) and item.get("key") is not None:
+                    params[str(item["key"])] = str(item.get("value") or "")
+        elif isinstance(raw_params, dict):
+            params = {str(k): str(v) for k, v in raw_params.items()}
+        common_params = common.get("parameters")
+        if isinstance(common_params, dict):
+            params.update({str(k): str(v) for k, v in common_params.items()})
+
+        space = envelope.get("space") or payload.get("space") or {}
+        message = envelope.get("message") or payload.get("message") or {}
+        return {
+            "function": function,
+            "params": params,
+            "space": (space.get("name") if isinstance(space, dict) else "") or "",
+            "message_name": (
+                (message.get("name") if isinstance(message, dict) else "") or ""
+            ),
+        }
+    async def _dispatch_card_click(self, click: Dict[str, Any]) -> None:
+        params = dict(click.get("params") or {})
+        function = str(click.get("function") or "")
+        if function != "hermes_clarify" and params.get("clarify_id"):
+            function = "hermes_clarify"
+        if function != "hermes_clarify":
+            logger.info(
+                "[GoogleChat] Ignoring card click function=%s",
+                function or "<none>",
+            )
+            return
+        await self._resolve_clarify_card(params)
+    async def _resolve_clarify_card(self, params: Dict[str, str]) -> None:
+        clarify_id = (params.get("clarify_id") or "").strip()
+        choice = params.get("choice") or ""
+        if not clarify_id:
+            logger.info("[GoogleChat] CARD_CLICKED missing clarify_id; ignoring")
+            return
+        if choice == "__other__":
+            flipped = False
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+
+                flipped = mark_awaiting_text(clarify_id)
+            except Exception:
+                logger.warning(
+                    "[GoogleChat] mark_awaiting_text failed", exc_info=True
+                )
+            if not flipped:
+                self._clarify_state.pop(clarify_id, None)
+                logger.warning(
+                    "[GoogleChat] clarify Other: no pending entry id=%s",
+                    clarify_id,
+                )
+                return
+            logger.info(
+                "[GoogleChat] clarify %s awaiting typed answer", clarify_id
+            )
+            return
+        self._clarify_state.pop(clarify_id, None)
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            ok = resolve_gateway_clarify(clarify_id, choice)
+        except Exception:
+            logger.exception("[GoogleChat] resolve_gateway_clarify failed")
+            ok = False
+        if ok:
+            logger.info(
+                "[GoogleChat] clarify button resolved id=%s choice=%r",
+                clarify_id,
+                choice[:80],
+            )
+        else:
+            logger.warning(
+                "[GoogleChat] clarify button: no pending entry id=%s",
+                clarify_id,
+            )
+
     def _on_pubsub_message(self, message: Any) -> None:
         """Pub/Sub callback — parse envelope and dispatch to the asyncio loop.
         Runs in a SubscriberClient worker thread: never block, never raise (that
@@ -908,9 +1240,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
             elif "widget" in ce_type or "card" in ce_type.lower():
                 logger.info("[GoogleChat] Card/widget event ack'd (v2 feature, deferred)")
             else:
-                prepared = self._prepare_inbound(envelope, ce_type)
-                if prepared is not None:
-                    self._submit_on_loop(self._dispatch_message(*prepared))
+                # Card clicks (clarify buttons) first — Workspace Add-ons attach
+                # ``commonEventObject`` to MESSAGE envelopes too, so the click
+                # check must run before the message dispatch.
+                click = self._extract_card_click(envelope, ce_type)
+                if click is not None:
+                    self._submit_on_loop(self._dispatch_card_click(click))
+                else:
+                    prepared = self._prepare_inbound(envelope, ce_type)
+                    if prepared is not None:
+                        self._submit_on_loop(self._dispatch_message(*prepared))
             message.ack()
         except Exception:
             logger.exception("[GoogleChat] Error in _on_pubsub_message")
@@ -918,6 +1257,12 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 message.ack()
 
     async def dispatch_http_event(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        click = self._extract_card_click(envelope)
+        if click is not None:
+            await self._dispatch_card_click(click)
+            # Synchronous ActionResponse so Chat does not show
+            # "unable to process your request" on the button.
+            return {"actionResponse": {"type": "UPDATE_MESSAGE"}}
         prepared = self._prepare_inbound(envelope)
         if prepared is not None:
             await self._dispatch_message(*prepared)
@@ -985,10 +1330,11 @@ class GoogleChatAdapter(BasePlatformAdapter):
             if command_id and not text.startswith("/"):
                 text = f"/cmd_{command_id} {text}".strip()
 
+        attachments = msg.get("attachment") or []
         media_urls: List[str] = []
         media_types: List[str] = []
         message_type = MessageType.TEXT
-        for att in msg.get("attachment") or []:
+        for att in attachments:
             try:
                 local_path, mime = await self._download_attachment(att)
             except Exception:
@@ -1003,6 +1349,17 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 message_type = _mime_for_message_type(mime or "")
         if slash:
             message_type = MessageType.COMMAND
+        if attachments and not media_urls and not text:
+            # File-only Chat messages have empty ``text``. If every download
+            # failed (typical in OpenShell when media.download used httplib2
+            # and bypassed HTTPS_PROXY), do not dispatch an empty user turn —
+            # Vertex Gemini 3.x 400s with "Requests ending with a model turn
+            # are not supported" against a session that already ends on
+            # assistant.
+            text = (
+                "[The user sent a file in Google Chat, but Hermes could not "
+                "download it. Ask them to resend or paste the contents.]"
+            )
 
         # PRE-increment count (persisted) drives the main-flow-vs-side-thread heuristic.
         prev_thread_count = self._thread_count_store.incr(space_name, thread_name) if thread_name and space_name else 0
@@ -1051,6 +1408,11 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if resource_name:
             def _fetch_media() -> bytes:
                 req = self._chat_api.media().download_media(resourceName=resource_name)
+                # The discovery client's default httplib2 DNS-resolves
+                # chat.googleapis.com and ignores HTTPS_PROXY. Bind the
+                # same authed client used for messages.create (requests
+                # when GOOGLE_CHAT_HTTP_CLIENT=requests).
+                req.http = self._new_authed_http()
                 from googleapiclient.http import MediaIoBaseDownload
                 import io
 
@@ -1061,7 +1423,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 return buf.getvalue()
             try:
                 data = await asyncio.to_thread(_fetch_media)
-            except HttpError as exc:
+            except Exception as exc:
                 logger.warning("[GoogleChat] media.download_media failed: %s", _redact_sensitive(str(exc)))
         if data is None and download_uri:
             if not _is_google_owned_host(download_uri):
@@ -1177,6 +1539,19 @@ class GoogleChatAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not choices:
             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+
+        # onClick.action requires a synchronous CARD_CLICKED ActionResponse.
+        # Pub/Sub Chat apps cannot provide one, so Google Chat shows
+        # "Hermes is unable to process your request" and the clarify wait
+        # never unblocks. HTTP-event mode can answer the click.
+        if not self._http_events_url:
+            logger.info(
+                "[GoogleChat] Skipping clarify card (Pub/Sub cannot answer "
+                "CARD_CLICKED); using numbered text prompt"
+            )
+            return await super().send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata
+            )
 
         def _button(text: str, choice: str) -> Dict[str, Any]:
             return {"text": text, "action": "hermes_clarify", "parameters": {"clarify_id": clarify_id, "choice": choice}}
