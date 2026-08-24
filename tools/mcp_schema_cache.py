@@ -72,12 +72,34 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     return None if expired else entry
 
 
-def write_cache_entry(server_name: str, fingerprint: str, *, tools: List[dict],
-                      utility_tools: Optional[List[dict]] = None, ttl_ms: Optional[float] = None,
-                      cache_scope: Optional[str] = None) -> None:
-    """Persist tool schemas after a successful live connect. ``ttl_ms`` / ``cache_scope`` are
-    the server's ``tools/list`` SEP-2549 hints; ``written_at`` anchors TTL expiry."""
-    entry = {"fingerprint": fingerprint, "tools": tools, "utility_tools": utility_tools or []}
+def has_cached_entry(server_name: str, fingerprint: str) -> bool:
+    return get_cached_entry(server_name, fingerprint) is not None
+
+
+def write_cache_entry(
+    server_name: str,
+    fingerprint: str,
+    *,
+    tools: List[dict],
+    utility_tools: Optional[List[dict]] = None,
+    instructions: Optional[str] = None,
+    ttl_ms: Optional[float] = None,
+    cache_scope: Optional[str] = None,
+) -> None:
+    """Persist tool schemas after a successful live connect.
+
+    ``ttl_ms``/``cache_scope`` are the SEP-2549 hints from the server's
+    ``tools/list`` result (2026-07-28 servers). ``written_at`` anchors TTL
+    expiry in :func:`get_cached_entry`. ``instructions`` is the normalized
+    server-level usage guidance from the initialize/discover result.
+    """
+    entry = {
+        "fingerprint": fingerprint,
+        "tools": tools,
+        "utility_tools": utility_tools or [],
+    }
+    if isinstance(instructions, str) and instructions.strip():
+        entry["instructions"] = instructions
     if isinstance(ttl_ms, (int, float)):
         entry["ttl_ms"] = ttl_ms
         entry["written_at"] = time.time()
@@ -107,6 +129,12 @@ def tools_from_cache_entry(entry: dict) -> List[dict]:
 def utility_tools_from_cache_entry(entry: dict) -> List[dict]:
     """Return cached ``{schema, handler_key}`` utility rows."""
     return _list_field(entry, "utility_tools")
+
+
+def instructions_from_cache_entry(entry: dict) -> str:
+    """Return cached server-level MCP instructions, if present."""
+    instructions = entry.get("instructions")
+    return instructions if isinstance(instructions, str) else ""
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

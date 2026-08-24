@@ -621,6 +621,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
     stable_parts.extend(_guidance_parts(agent))
+    # MCP servers may return cross-tool usage guidance in the initialize
+    # result. Include only guidance for the MCP tools this session exposes,
+    # and keep it in the stable tier for prompt-cache stability.
+    try:
+        from tools.mcp_tool_discovery import get_mcp_server_instructions
+
+        mcp_instructions = get_mcp_server_instructions(
+            tool_names=agent.valid_tool_names,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+        )
+    except Exception:
+        mcp_instructions = ""
+    if mcp_instructions:
+        stable_parts.append(mcp_instructions)
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).

@@ -10,6 +10,7 @@ from typing import Dict, Optional, Set
 from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _handshake_rejected_as_modern, _make_redirect_header_stripper, _resolve_client_cert
 from tools.mcp_tool_lifecycle import _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
 from tools.mcp_tool_common import _core
+from tools.mcp_tool_schema import _normalize_mcp_server_instructions
 from tools import mcp_tool_config as _config
 from tools import mcp_tool_lifecycle as _lifecycle
 from tools import mcp_tool_registration as _registration
@@ -61,6 +62,13 @@ class MCPServerTransportMixin:
         caps = getattr(self.initialize_result, "capabilities", None)
         return caps is None or getattr(caps, "tools", None) is not None
 
+    def _capture_server_instructions(self, result: Any) -> None:
+        """Capture optional instructions from either MCP negotiation result."""
+        self.server_instructions = _normalize_mcp_server_instructions(
+            self.name,
+            getattr(result, "instructions", None),
+        )
+
     def _session_kwargs(self) -> dict:
         """ClientSession kwargs: sampling, elicitation, notification + logging callbacks."""
         kwargs = {}
@@ -111,6 +119,7 @@ class MCPServerTransportMixin:
         breaker state but leaves the session UNPROVEN: flapping transports handshake fine and drop
         moments later, so only keepalive/tool-call success clears the reconnect budget."""
         self.initialize_result = await self._negotiate_session(session, connect_timeout)
+        self._capture_server_instructions(self.initialize_result)
         self.session = session
         if mark_lifecycle:
             self._mark_lifecycle_started()

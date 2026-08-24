@@ -7,7 +7,7 @@ import fnmatch
 import re
 from typing import Any, List
 from tools.ansi_strip import strip_unicode_tags
-from tools.mcp_tool_common import mcp_field
+from tools.mcp_tool_common import mcp_field, _sanitize_error
 
 logger = logging.getLogger("tools.mcp_tool")
 
@@ -38,6 +38,36 @@ def _scan_mcp_description(server_name: str, tool_name: str, description: str) ->
         logger.warning("MCP server '%s' tool '%s': suspicious description content — %s. Description: %.200s",
                        server_name, tool_name, "; ".join(findings), description)
     return findings
+
+
+# Server-level instructions become part of the cached system prompt. Bound
+# them independently from tool results so a server cannot turn one handshake
+# into an unbounded prompt prefix or a permanently oversized schema cache.
+_MCP_MAX_SERVER_INSTRUCTIONS_CHARS = 16_000
+
+
+def _normalize_mcp_server_instructions(server_name: str, instructions: Any) -> str:
+    """Normalize server-provided handshake guidance before prompt injection.
+
+    MCP instructions are useful model-facing metadata, but they are still
+    supplied by an external server. Strip invisible tag characters, redact
+    credential-shaped substrings, warn on the same suspicious patterns used for
+    tool descriptions, and cap the prompt-facing size.
+    """
+    if not isinstance(instructions, str):
+        return ""
+    text = strip_unicode_tags(instructions).strip()
+    if not text:
+        return ""
+    text = _sanitize_error(text)
+    if len(text) > _MCP_MAX_SERVER_INSTRUCTIONS_CHARS:
+        omitted = len(text) - _MCP_MAX_SERVER_INSTRUCTIONS_CHARS
+        text = (
+            text[:_MCP_MAX_SERVER_INSTRUCTIONS_CHARS]
+            + f"\n\n[server instructions truncated: {omitted:,} characters omitted]"
+        )
+    _scan_mcp_description(server_name, "<server instructions>", text)
+    return text
 
 
 _EMPTY_OBJECT_SCHEMA = {"type": "object", "properties": {}}

@@ -555,6 +555,115 @@ class TestSchemaConversion:
 
 
 # ---------------------------------------------------------------------------
+# Server instructions
+# ---------------------------------------------------------------------------
+
+class TestMCPServerInstructions:
+    def test_handshake_instructions_are_normalized(self):
+        from tools.mcp_tool import _normalize_mcp_server_instructions
+
+        result = _normalize_mcp_server_instructions(
+            "srv", "  Use search\U000e0001 before fetching.  "
+        )
+        assert result == "Use search before fetching."
+
+    def test_handshake_instructions_are_bounded(self):
+        from tools.mcp_tool import (
+            _MCP_MAX_SERVER_INSTRUCTIONS_CHARS,
+            _normalize_mcp_server_instructions,
+        )
+
+        result = _normalize_mcp_server_instructions("srv", "x" * (_MCP_MAX_SERVER_INSTRUCTIONS_CHARS + 10))
+
+        assert len(result) > _MCP_MAX_SERVER_INSTRUCTIONS_CHARS
+        assert len(result.split("\n\n", 1)[0]) == _MCP_MAX_SERVER_INSTRUCTIONS_CHARS
+        assert "characters omitted" in result
+
+    def test_registered_server_instructions_are_exposed_for_active_tools(self):
+        """InitializeResult.instructions should reach the active MCP surface."""
+        from tools.mcp_tool import (
+            _forget_mcp_server_instructions,
+            _register_server_tools,
+            get_mcp_server_instructions,
+        )
+        from tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        server = _make_mock_server(
+            "context-server",
+            session=MagicMock(),
+            tools=[_make_mcp_tool("semantic_search", "Search the knowledge base")],
+        )
+        server.server_instructions = "Call semantic_search for VME questions."
+        server._config = {"command": "fake"}
+
+        with patch("tools.registry.registry", registry):
+            registered = _register_server_tools(
+                "context-server",
+                server,
+                {"tools": {"resources": False, "prompts": False}},
+            )
+
+        try:
+            instructions = get_mcp_server_instructions(tool_names=registered)
+            assert "Call semantic_search for VME questions." in instructions
+            assert "context-server" in instructions
+        finally:
+            for tool_name in registered:
+                registry.deregister(tool_name)
+            _forget_mcp_server_instructions("context-server")
+
+    def test_only_visible_mcp_servers_are_included(self):
+        from tools.mcp_tool import (
+            _forget_mcp_server_instructions,
+            _mcp_server_instructions,
+            _mcp_tool_server_names,
+            get_mcp_server_instructions,
+        )
+
+        _mcp_tool_server_names.update({
+            "mcp__visible__search": "visible",
+            "mcp__hidden__search": "hidden",
+        })
+        _mcp_server_instructions.update({
+            "visible": "Use the visible server.",
+            "hidden": "Do not include the hidden server.",
+        })
+        try:
+            result = get_mcp_server_instructions(
+                tool_names={"mcp__visible__search"},
+                enabled_toolsets=[],
+            )
+            assert "Use the visible server." in result
+            assert "Do not include the hidden server." not in result
+        finally:
+            _mcp_tool_server_names.pop("mcp__visible__search", None)
+            _mcp_tool_server_names.pop("mcp__hidden__search", None)
+            _forget_mcp_server_instructions("visible")
+            _forget_mcp_server_instructions("hidden")
+
+    def test_instructions_are_included_when_server_toolset_is_enabled(self):
+        from tools.mcp_tool import (
+            _forget_mcp_server_instructions,
+            _mcp_server_instructions,
+            _mcp_tool_server_names,
+            get_mcp_server_instructions,
+        )
+
+        _mcp_tool_server_names["mcp__context_server__search"] = "context-server"
+        _mcp_server_instructions["context-server"] = "Search before fetching."
+        try:
+            result = get_mcp_server_instructions(
+                tool_names={"tool_search"},
+                enabled_toolsets=["mcp-context-server"],
+            )
+            assert "Search before fetching." in result
+        finally:
+            _mcp_tool_server_names.pop("mcp__context_server__search", None)
+            _forget_mcp_server_instructions("context-server")
+
+
+# ---------------------------------------------------------------------------
 # Check function
 # ---------------------------------------------------------------------------
 

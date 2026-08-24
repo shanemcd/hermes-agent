@@ -73,6 +73,21 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
         _core._mcp_tool_server_names.pop(tool_name, None)
 
 
+def _track_mcp_server_instructions(server_name: str, instructions: str) -> None:
+    """Remember normalized server instructions for prompt assembly."""
+    with _core._lock:
+        if instructions:
+            _core._mcp_server_instructions[server_name] = instructions
+        else:
+            _core._mcp_server_instructions.pop(server_name, None)
+
+
+def _forget_mcp_server_instructions(server_name: str) -> None:
+    """Forget server instructions when its tools leave the active registry."""
+    with _core._lock:
+        _core._mcp_server_instructions.pop(server_name, None)
+
+
 def _server_key_for_task(server) -> object:
     """Connection key of a live ``MCPServerTask`` (teardown runs on the MCP loop without the
     discovering profile's context, so the key is found by identity, never re-derived)."""
@@ -345,6 +360,7 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
                          "skipping provenance/count updates", name, c.origin, c.registry_name)
     if registered:
         registry.register_toolset_alias(name, toolset_name)
+    _track_mcp_server_instructions(name, getattr(server, "server_instructions", ""))
     return registered
 
 
@@ -373,6 +389,7 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
                            for e in _select_utility_schemas(name, server, config)]
         cache_meta = getattr(server, "_list_cache_meta", None) or {}
         write_cache_entry(name, config_fingerprint(config), tools=tools_payload, utility_tools=utility_payload,
+                          instructions=getattr(server, "server_instructions", ""),
                           ttl_ms=cache_meta.get("ttl_ms"), cache_scope=cache_meta.get("cache_scope"))
     except Exception as exc:
         logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
@@ -494,7 +511,12 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     Lazy startup (#56832, design by Vansh5632): tools appear in the registry immediately; the first real
     call routes through ``_get_connected_server_for_call`` → ``_ensure_lazy_server_connected``.
     """
-    from tools.mcp_schema_cache import config_fingerprint, tools_from_cache_entry, utility_tools_from_cache_entry
+    from tools.mcp_schema_cache import (
+        config_fingerprint,
+        instructions_from_cache_entry,
+        tools_from_cache_entry,
+        utility_tools_from_cache_entry,
+    )
     tool_timeout = _resolve_tool_timeout(config)
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
@@ -509,4 +531,10 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             _core._lazy_server_fingerprints[key] = config_fingerprint(config)
             _core._lazy_server_tool_names[key] = list(registered)
         logger.info("MCP server '%s' (lazy): registered %d tool(s) from schema cache", name, len(registered))
+    _track_mcp_server_instructions(
+        name,
+        _schema._normalize_mcp_server_instructions(
+            name, instructions_from_cache_entry(entry)
+        ),
+    )
     return registered

@@ -30,6 +30,11 @@ from tools.mcp_tool_transport import MCPServerTransportMixin
 from tools.mcp_tool_server_run import MCPServerRunMixin
 from tools.mcp_tool_health import MCPServerHealthMixin
 
+# Server-level instructions become part of the cached system prompt. Bound
+# them independently from tool results so a server cannot turn one handshake
+# into an unbounded prompt prefix or a permanently oversized schema cache.
+_MCP_MAX_SERVER_INSTRUCTIONS_CHARS = 16_000
+
 
 # Wall-clock bound on the fail-open OSV malware preflight before a stdio spawn; just ABOVE
 # osv_check._TIMEOUT (10s) so it only bites when a stalled SSL handshake defeats that.
@@ -313,7 +318,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_tools", "_error", "_config", "_sampling", "_elicitation", "_registered_tool_names",
         "_auth_type", "_refresh_lock", "_rpc_lock", "_pending_refresh_tasks", "_pending_call_context",
         "_lifecycle_started_at", "_last_tool_call_at", "_idle_timeout_seconds", "_max_lifetime_seconds",
-        "_recycled_reason", "initialize_result", "_ping_unsupported", "_list_cache_meta",
+        "_recycled_reason", "initialize_result", "server_instructions", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
         "_ever_connected")
@@ -385,6 +390,10 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession`` method attribute
         # corresponds to a supported server method. See #18051.
         self.initialize_result: Optional[Any] = None
+        # The optional ``instructions`` field is server-level usage guidance
+        # from the initialize/discover response. Keep the normalized value on
+        # the task so live registration and the schema cache share one source.
+        self.server_instructions: str = ""
         # SEP-2549 cache hints from the last tools/list (ttl_ms, cache_scope).
         self._list_cache_meta: dict = {}
         # Latched when ``ping`` returns -32601; keepalives then use list_tools. Reset per connect.
@@ -500,6 +509,8 @@ def _reset_server_error(server_name: str) -> None:
 _parallel_safe_servers: set = set()
 # registry tool name -> raw server name (the generated name is lossy; never re-parse it).
 _mcp_tool_server_names: Dict[str, str] = {}
+# Normalized server-level usage guidance from MCP initialize/discover results.
+_mcp_server_instructions: Dict[str, str] = {}
 
 # Dedicated event loop in a background daemon thread; _lock guards the loop handles, _servers,
 # the status maps and the PID ledgers.
@@ -630,6 +641,7 @@ def _update_death_supervisor(verb: str, pgids) -> None:
             except Exception:  # noqa: BLE001 - timeout or already gone; either way we drop it
                 pass
             _death_supervisor = None
+
 
 
 def _mcp_registry_scope() -> Optional[str]:

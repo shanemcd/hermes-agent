@@ -408,6 +408,8 @@ class MCPServerRunMixin:
             await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
+        from tools.mcp_tool_registration import _forget_mcp_server_instructions
+        _forget_mcp_server_instructions(self.name)
         self.session = None
 
     def _deregister_tools(self) -> None:
@@ -416,3 +418,11 @@ class MCPServerRunMixin:
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
             _registration._deregister_mcp_tool_all_scopes(self, tool_name)
         self._registered_tool_names = []
+        # Drop prompt-facing server instructions once no registered tool still
+        # maps to this server (parks/reconnects keep the entry while any tool
+        # remains; a full shutdown clears it).
+        if not any(
+            server_name == self.name
+            for server_name in _core._mcp_tool_server_names.values()
+        ):
+            _registration._forget_mcp_server_instructions(self.name)

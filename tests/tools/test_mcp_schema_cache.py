@@ -39,11 +39,19 @@ class TestCacheRoundTrip:
     def test_write_then_read_with_matching_fingerprint(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
         tools = [{"name": "t1", "description": "d", "inputSchema": {"type": "object"}}]
-        msc.write_cache_entry("srv", "fp1", tools=tools, utility_tools=[])
+        msc.write_cache_entry(
+            "srv",
+            "fp1",
+            tools=tools,
+            utility_tools=[],
+            instructions="Use search before fetching documents.",
+        )
         entry = msc.get_cached_entry("srv", "fp1")
         assert entry is not None
         assert msc.tools_from_cache_entry(entry) == tools
         assert msc.utility_tools_from_cache_entry(entry) == []
+        assert entry["instructions"] == "Use search before fetching documents."
+        assert msc.has_cached_entry("srv", "fp1")
 
     def test_fingerprint_mismatch_returns_none(self, monkeypatch, tmp_path):
         self._isolate(monkeypatch, tmp_path)
@@ -65,6 +73,8 @@ class TestCacheRoundTrip:
     def test_malformed_entry_shapes_are_tolerated(self):
         assert msc.tools_from_cache_entry({"tools": "nope"}) == []
         assert msc.utility_tools_from_cache_entry({}) == []
+        assert msc.instructions_from_cache_entry({"instructions": "hint"}) == "hint"
+        assert msc.instructions_from_cache_entry({"instructions": 42}) == ""
 
 
 class TestCacheFileLocation:
