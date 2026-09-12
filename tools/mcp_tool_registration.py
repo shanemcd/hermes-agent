@@ -360,7 +360,6 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
                          "skipping provenance/count updates", name, c.origin, c.registry_name)
     if registered:
         registry.register_toolset_alias(name, toolset_name)
-    _track_mcp_server_instructions(name, getattr(server, "server_instructions", ""))
     return registered
 
 
@@ -409,6 +408,7 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
     if registered:
         _write_schema_cache(name, server, config, should_register)
+    _track_mcp_server_instructions(name, getattr(server, "server_instructions", ""))
     return registered
 
 
