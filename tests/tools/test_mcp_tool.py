@@ -560,7 +560,7 @@ class TestSchemaConversion:
 
 class TestMCPServerInstructions:
     def test_handshake_instructions_are_normalized(self):
-        from tools.mcp_tool import _normalize_mcp_server_instructions
+        from tools.mcp_tool_schema import _normalize_mcp_server_instructions
 
         result = _normalize_mcp_server_instructions(
             "srv", "  Use search\U000e0001 before fetching.  "
@@ -568,7 +568,7 @@ class TestMCPServerInstructions:
         assert result == "Use search before fetching."
 
     def test_handshake_instructions_are_bounded(self):
-        from tools.mcp_tool import (
+        from tools.mcp_tool_schema import (
             _MCP_MAX_SERVER_INSTRUCTIONS_CHARS,
             _normalize_mcp_server_instructions,
         )
@@ -581,11 +581,11 @@ class TestMCPServerInstructions:
 
     def test_registered_server_instructions_are_exposed_for_active_tools(self):
         """InitializeResult.instructions should reach the active MCP surface."""
-        from tools.mcp_tool import (
+        from tools.mcp_tool_registration import (
             _forget_mcp_server_instructions,
             _register_server_tools,
-            get_mcp_server_instructions,
         )
+        from tools.mcp_tool_discovery import get_mcp_server_instructions
         from tools.registry import ToolRegistry
 
         registry = ToolRegistry()
@@ -614,12 +614,9 @@ class TestMCPServerInstructions:
             _forget_mcp_server_instructions("context-server")
 
     def test_only_visible_mcp_servers_are_included(self):
-        from tools.mcp_tool import (
-            _forget_mcp_server_instructions,
-            _mcp_server_instructions,
-            _mcp_tool_server_names,
-            get_mcp_server_instructions,
-        )
+        from tools.mcp_tool_registration import _forget_mcp_server_instructions
+        from tools.mcp_tool_discovery import get_mcp_server_instructions
+        from tools.mcp_tool import _mcp_server_instructions, _mcp_tool_server_names
 
         _mcp_tool_server_names.update({
             "mcp__visible__search": "visible",
@@ -643,12 +640,9 @@ class TestMCPServerInstructions:
             _forget_mcp_server_instructions("hidden")
 
     def test_instructions_are_included_when_server_toolset_is_enabled(self):
-        from tools.mcp_tool import (
-            _forget_mcp_server_instructions,
-            _mcp_server_instructions,
-            _mcp_tool_server_names,
-            get_mcp_server_instructions,
-        )
+        from tools.mcp_tool_registration import _forget_mcp_server_instructions
+        from tools.mcp_tool_discovery import get_mcp_server_instructions
+        from tools.mcp_tool import _mcp_server_instructions, _mcp_tool_server_names
 
         _mcp_tool_server_names["mcp__context_server__search"] = "context-server"
         _mcp_server_instructions["context-server"] = "Search before fetching."
