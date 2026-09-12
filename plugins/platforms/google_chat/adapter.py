@@ -1059,6 +1059,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 d["space"] = space
         return msg_with_space, enriched_env
 
+    @staticmethod
     def _is_card_click_event(envelope: Dict[str, Any], ce_type: str = "") -> bool:
         """True only for interaction/click events, not ordinary MESSAGE envelopes.
 
@@ -1086,6 +1087,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if isinstance(common, dict) and common.get("invokedFunction"):
             return True
         return False
+    @staticmethod
     def _extract_card_click(
         envelope: Dict[str, Any], ce_type: str = ""
     ) -> Optional[Dict[str, Any]]:
