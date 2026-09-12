@@ -1427,6 +1427,12 @@ class TestThreadCountStore:
 # ===========================================================================
 
 
+def _async_of(value):
+    async def _fake(data=None, filename=None):
+        return value
+    return _fake
+
+
 class TestAttachmentSSRFGuard:
 
     @pytest.mark.asyncio
@@ -1501,8 +1507,8 @@ class TestAttachmentSSRFGuard:
         ), patch("asyncio.to_thread", _run_thread):
             from plugins.platforms.google_chat import adapter as gc_mod
             with patch.object(
-                gc_mod, "cache_document_from_bytes",
-                lambda data, filename=None: "/tmp/out.pdf",
+                gc_mod, "cache_document_from_bytes_async",
+                _async_of("/tmp/out.pdf"),
             ):
                 path, mime = await adapter._download_attachment(attachment)
 
@@ -1541,8 +1547,8 @@ class TestAttachmentSSRFGuard:
         adapter._new_authed_http = MagicMock()
         from plugins.platforms.google_chat import adapter as gc_mod
         monkeypatch.setattr(
-            gc_mod, "cache_document_from_bytes",
-            lambda data, filename=None: "/tmp/hello.txt",
+            gc_mod, "cache_document_from_bytes_async",
+            _async_of("/tmp/hello.txt"),
         )
 
         path, mime = await adapter._download_attachment(attachment)
