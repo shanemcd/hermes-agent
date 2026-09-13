@@ -366,15 +366,18 @@ def _resolve_pubsub_transport(extra: Optional[Dict[str, Any]] = None) -> str:
 
 
 def _resolve_http_client(extra: Optional[Dict[str, Any]] = None) -> str:
-    """Return ``httplib2`` (default) or ``requests`` for Chat REST execute().
+    """Return ``httplib2`` or ``requests`` for Chat REST execute().
 
     ``requests`` honors HTTPS_PROXY without PySocks. Override with
     ``platforms.google_chat.http_client`` or ``GOOGLE_CHAT_HTTP_CLIENT``.
+    Default to ``requests`` whenever an env proxy is configured: raw
+    httplib2 DNS-resolves hosts locally, which fails in sandboxes where
+    name resolution is intercepted (e.g. OpenShell egress proxying).
     """
     raw = (
         (extra or {}).get("http_client")
         or os.getenv("GOOGLE_CHAT_HTTP_CLIENT")
-        or "httplib2"
+        or ("requests" if os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") else "httplib2")
     )
     val = str(raw).strip().lower()
     if val not in {"httplib2", "requests"}:
@@ -805,9 +808,21 @@ class GoogleChatAdapter(BasePlatformAdapter):
         except (ValueError, FileNotFoundError) as exc:
             return self._connect_failed("[GoogleChat] Config validation failed: %s", exc, "config_invalid", retryable=False)
         self._project_id, self._subscription_path, self._credentials = project_id, subscription_path, credentials
+        self._use_requests_http = _resolve_http_client(self.config.extra) == "requests"
         try:
-            self._chat_api = await asyncio.to_thread(
-                lambda: build_service("chat", "v1", credentials=credentials, cache_discovery=False))
+            if self._use_requests_http:
+                # Discovery fetch + REST execute must honor HTTPS_PROXY: raw
+                # httplib2 only applies env proxies when PySocks is installed,
+                # and DNS-resolves chat.googleapis.com locally, which fails in
+                # sandboxes where name resolution is intercepted/proxied.
+                self._chat_api = await asyncio.to_thread(
+                    lambda: build_service(
+                        "chat", "v1",
+                        http=AuthorizedHttp(credentials, http=_EnvProxyHttp()),
+                        cache_discovery=False))
+            else:
+                self._chat_api = await asyncio.to_thread(
+                    lambda: build_service("chat", "v1", credentials=credentials, cache_discovery=False))
         except Exception as exc:
             return self._connect_failed("[GoogleChat] Failed to build Chat API client: %s", exc, "chat_api_init", retryable=False)
         await self._load_user_oauth()
@@ -1660,6 +1675,10 @@ class GoogleChatAdapter(BasePlatformAdapter):
     def _new_authed_http(self) -> Any:
         """Fresh AuthorizedHttp per call: httplib2 shares SSL state, so the discovery
         client is not thread-safe across ``asyncio.to_thread`` workers."""
+        if getattr(self, "_use_requests_http", False):
+            # requests honors HTTPS_PROXY without PySocks; raw httplib2 would
+            # DNS-resolve locally and fail under an intercepting proxy.
+            return AuthorizedHttp(self._credentials, http=_EnvProxyHttp())
         return AuthorizedHttp(self._credentials, http=httplib2.Http(timeout=30))
 
     async def _call_with_retry(self, sync_fn: Callable[[], Any], *, op_name: str = "chat-api-call") -> Any:
