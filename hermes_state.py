@@ -39,6 +39,7 @@ from hermes_state_guard import (
     _set_last_init_error, get_last_init_error,
 )
 from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
+import hermes_state_lockguard as _lockguard
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
@@ -455,6 +456,8 @@ class SessionDB(
         # is transient EMFILE, and a permanent flag would demote every reader forever.
         self._read_open_failed_at = 0.0
         self._wal_active, self._write_count = False, 0
+        # OFD WAL-generation guard for the writer descriptor (hermes_state_lockguard); lifted in close().
+        self._wal_lock_guard: dict = {}
         # File identity of the opened state.db, compared on every write so an out-of-band
         # replace cannot limp through in-place surgery (inode: mv/new-file; application_id: cp).
         self._db_file_identity: Optional[tuple] = None
@@ -544,6 +547,10 @@ class SessionDB(
             self._connect_and_init_with_lock_patience()
         # FTS optimization is OPT-IN (`hermes db optimize`); no background worker races session lifecycle.
         self._ensure_db_file_generation()
+        if self._wal_active:
+            # Hold the WAL generation's locks as OFD locks so a stray in-process open()/close()
+            # cannot cancel them and let a sibling unlink -wal/-shm under this live writer.
+            self._wal_lock_guard = _lockguard.hold(self.db_path)
 
     def _open_read_only(self) -> None:
         """Read-only attach for cross-profile aggregation: no schema init, NO write
@@ -797,6 +804,8 @@ class SessionDB(
                 f"in flight (a session-teardown path called close() before "
                 f"this worker finished — #94736) and the automatic reopen failed: {exc}"
             ) from exc
+        if self._wal_active:  # a reopened writer is a live generation holder like the first open
+            self._wal_lock_guard = _lockguard.hold(self.db_path)
 
     def _reopen_writer_after_cantopen(self) -> None:
         """Replace a writer connection whose live handle raised SQLITE_CANTOPEN.
@@ -824,6 +833,12 @@ class SessionDB(
                 flag = getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)
                 if flag is not None and hasattr(old, "setconfig"):
                     old.setconfig(flag, True)
+            # Release the live handle's OFD guard before its descriptor closes, then re-hold
+            # for the replacement (close() does the same).
+            if self._wal_lock_guard:
+                with contextlib.suppress(Exception):
+                    _lockguard.release(self._wal_lock_guard)
+                self._wal_lock_guard = {}
             self._close_connection_quietly(old)
             try:
                 self._conn = self._open_writer_conn()
@@ -834,6 +849,8 @@ class SessionDB(
                 ) from exc
             self._db_file_identity = _stat_db_file_identity(self.db_path)
             self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
+            if self._wal_active:
+                self._wal_lock_guard = _lockguard.hold(self.db_path)
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
@@ -1325,6 +1342,10 @@ class SessionDB(
             return
         try:
             with self._lock:
+                if self._conn is None:
+                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
+                if self._wal_lock_guard:
+                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
                 result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
@@ -1401,6 +1422,7 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
                     self._conn = None
